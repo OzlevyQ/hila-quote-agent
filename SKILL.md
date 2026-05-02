@@ -84,21 +84,81 @@ Do not attempt school identification for internal/no-reply senders.
 
 ### Stage D — Identify each book (research deeply)
 
-For every line item, in order:
+For every line item, follow this algorithm. **Do not skip steps. Do not give up after one search.**
 
-1. If there is a `Sku# / mfrSku / דאנאקוד` → `lookup_book_by_id`. This is authoritative.
-2. Otherwise → `search_book_by_title` with distinctive words. Use grade, שכבה, subject, edition (חדש / ישן / מותאם / מדריך מורה) as disambiguators.
-3. **Do not give up after one search.** If nothing matches:
-   - Strip punctuation and quotes (`"`, `״`, `'`).
-   - Try partial titles, individual distinctive words, the series name alone.
-   - Try Hebrew↔English variants of the title.
-   - Try without grade/edition modifiers, then re-add them.
-   - Try the publisher name plus a content word.
-4. If the local catalog returns 0 across all the above, fall back to MCP `search_records` (after `list_tables_for_base` to confirm field names). Never call `list_records_for_table` with `recordIds`.
-5. Multiple plausible matches (e.g., editions) → **do not pick one silently.** Either ask one focused question, or list the top candidates briefly and ask which.
-6. Single plausible-but-not-certain match → include it in the quote with the exact line: **"מבקשת לוודא שזה המק״ט הרלוונטי."**
-7. Genuinely no match after exhaustive search → say so clearly:
-   > את [שם הספר] לא מצאתי במאגר. תוכלי לוודא את השם והמהדורה או לשלוח מק״ט / דאנאקוד?
+#### D.1 — Tokenize the line
+
+From the customer's free-text description, extract a TOKEN LIST. Be aggressive — even messy phrasing must be broken down.
+
+- **Identifier**: any `\d{3}-\d{4,7}` (Dana code), or any standalone 4-12 digit number (mfrSku/SKU).
+- **Series name** (highest priority — match these first): `עולמות`, `שבילים`, `ארכימדס`, `ECB`, `Unseens`, `ניצנים`, `פירות הארץ`, `מבט חדש`, `חוברת השבחה`, `השבחה`, `רוויו`, `ניב המכפלה`, `קסם`.
+- **Subject**: `חשבון`, `מתמטיקה`, `אנגלית`, `לשון`, `תנ"ך`, `היסטוריה`, `גיאוגרפיה`, `פיזיקה`, `ביולוגיה`, `כימיה`, `מקרא`, `גמרא`.
+- **Grade**: from `כיתה X`, `שכבת X`, `לכתה X`, `X'` / `X׳`, or digits 1-12 → normalize to א-יב.
+- **Publisher**: `יואל גבע`, `מטח`, `רכס`, `ערך`.
+- **Modifiers**: `חדש`, `ישן`, `מותאם`, `מדריך מורה`.
+- **Visual hints** (helpful for disambiguation but rarely in titles): `אדום`, `כחול`, `ירוק`, `red`, `blue`.
+
+Strip Hebrew prefixes `ל/ב/מ/ה` from search terms before searching: `"לשבילים"` → `"שבילים"`, `"החוברות"` → `"חוברות"`.
+
+#### D.2 — Search escalation ladder
+
+Run searches in this order; STOP at the first step that returns a usable match.
+
+1. **Identifier present** → `lookup_book_by_id` (authoritative).
+2. **Series name alone** → `search_book_by_title` with just the series. E.g., `"שבילים"`, `"עולמות"`.
+3. **Subject alone** if no series → e.g., `"חשבון"`. Returns many; filter by grade locally.
+4. **Series + grade as filter** → from candidates of step 2, filter title contains grade letter.
+5. **Publisher + content word** → e.g., `"יואל גבע" + "מתמטיקה"`.
+6. **Each distinctive token individually** → one search per token.
+7. **Hebrew↔English variant** → e.g., `"מבט חדש"` ↔ `"New Vision"`, `"חוברות"` ↔ `"workbook"`.
+8. **MCP `search_records`** on the catalog table as last resort (after `list_tables_for_base` to confirm field names).
+
+If all 8 return 0 → genuine no-match.
+
+#### D.3 — Worked examples (showing the algorithm in action)
+
+**Example 1 — vague free text:**
+> Customer: *"אני צריך את הספר האדום של חשבון לכיתה ט'"*
+
+Tokens: subject=`חשבון`, color=`אדום`, grade=`ט`.
+- Step 3: `search_book_by_title("חשבון")` → 12 results.
+- Step 4: Filter where title contains `ט'` or `ט׳` → 2 results.
+- If one is named "ספר חשבון לכיתה ט' (אדום)" or similar → confident match.
+- If both candidates remain plausible → ask focused: *"רק לוודא, את מתכוונת לחשבון לכיתה ט' של איזו הוצאה?"*
+
+**Example 2 — numeric series:**
+> Customer: *"מבקשת 50 חוברות שבילים 9"*
+
+Tokens: series=`שבילים`, quantity=50, modifier="9".
+- Step 2: `search_book_by_title("שבילים")` → returns שבילים 1-12.
+- Pick the entry whose title is `"שבילים 9"` exactly → confident match.
+
+**Example 3 — explicit identifier:**
+> Customer: *"ECB Unseens 3, 153-898, 19 יח'"*
+
+Tokens: identifier=`153-898`, series=`ECB`, modifier=`Unseens`, quantity=19.
+- Step 1: `lookup_book_by_id("153-898")` → authoritative.
+
+**Example 4 — series with publisher:**
+> Customer: *"אבקש מחיר על מבט חדש לחיים, של יואל גבע, כיתה י"*
+
+Tokens: series=`מבט חדש`, publisher=`יואל גבע`, grade=`י`.
+- Step 2: `search_book_by_title("מבט חדש")` → returns several.
+- Step 4: filter for `י` → narrow.
+- Confirm publisher in title or skip to confident match if only one remains.
+
+**Example 5 — informal continuation:**
+> Customer: *"צריכה את הישן"* (in a thread about שבילים 9)
+
+This is a continuation — read prior thread context. "הישן" = old edition. Search for non-`חדש` variants of the series previously discussed.
+
+#### D.4 — Disposition
+
+- **1 confident match** (identifier or exact title) → use it.
+- **1 plausible match** (similar tokens but not exact title or grade) → include in quote with: **"מבקשת לוודא שזה המק״ט הרלוונטי."**
+- **2-5 plausible matches** → ask one focused question. Do not list them all.
+- **0 after the full ladder** → ask for identifier:
+  > את [שם הספר] לא מצאתי במאגר. תוכלי לוודא את השם והמהדורה או לשלוח מק״ט / דאנאקוד?
 
 ### Stage E — Quantities
 
