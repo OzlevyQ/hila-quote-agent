@@ -396,3 +396,269 @@ When `confidence < 0.85` OR `items.length === 0` OR any item is `unmatched`, pop
 ### Token budget
 
 You have ~8K tokens for this task. Be efficient: don't re-search the catalog for the same token; cache-by-tool-call within your reasoning.
+
+---
+
+## 9. Catalog Knowledge Base (deep)
+
+This section is the operational ground truth derived from a full audit of the live catalog (6,423 records, 2026-05-05). Apply these rules verbatim — they override any general intuition. Source of truth: `analysis/CATALOG-ANALYSIS.md` in the n8nbooks repo.
+
+### 9.1 Catalog metadata
+
+- **Base:** `appu3b1o75q2NVAWB`
+- **Catalog table:** `tblSaRPAGwg8J3P4B` (6,423 rows)
+- **Schools table:** `tblbyxYpswsaIC9Sw`
+- **Field IDs:**
+  - `fldfGlYgDyJId6UUF` = `Sku#` (number, internal PK — **not stable** for some rows)
+  - `fldL6ESYhftWPfcGJ` = `mfrSku·` (Dana code or ISBN — **canonical external ID**)
+  - `fldXn44mWQiXx6oW7` = `title·` (Hebrew/English)
+  - `fldlMYEOJg6anlg8s` = `group` (publisher singleSelect, 26.6% NULL)
+  - `fldjHpbjozJxc1lZ0` = `price#` (ILS, 0.5% null/zero)
+
+### 9.2 Iron rule: identifier-first routing
+
+**Always check for an identifier in the customer's line BEFORE any title search.**
+
+Detection patterns (applied in order):
+1. **ISBN-13:** 13 digits, often starts `978`/`979`.
+2. **ISBN-10:** 10 digits.
+3. **Dana / mfrSku:** `\d{2,4}-\d{1,7}` (hyphenated).
+4. **Sku numeric:** bare integer 4–12 digits.
+
+Found one → call `lookup_book_by_id` with the value as-is. **Never** route an identifier through `search_book_by_title` — Airtable's text index returns up to 8 fuzzy hits where a deterministic `=` filter returns 1.
+
+If `lookup_book_by_id` returns 0 hits with a Dana-shaped string → flag `fallbacks: ["mfrSku-not-found"]` and continue to title search; tell the customer in clarification that the code wasn't found.
+
+### 9.3 mfrSku is canonical, NOT Sku
+
+- Only **38%** of rows have `Sku == int(mfrSku.replace('-',''))`. The other 62% have an independent internal Sku.
+- **55 rows** have float-truncated Sku (e.g. `9.7801412` from precision overflow on the 13-digit ISBN `9780135234617`).
+- For lookup output: prefer `mfrSku` as the visible code; emit `Sku` only when `mfrSku` is empty (151 rows, mostly English ELT books).
+
+### 9.4 Discontinued / אזל = exclude unless asked
+
+- **746 rows (11.6%)** start with `**` → discontinued, do-not-order. Exclude from candidates.
+- **152 more** contain `אזל` mid-title.
+- Catalog encodes replacements inline: `**תנ"ך קורן לשוניות כתום-אזל במקומו הוציאו צבע בז'`. When you exclude a `**` candidate, scan the title for "במקומו" / "החליף" hints and surface the replacement SKU.
+- Only fall back to a `**` row if no live sibling exists AND the customer's identifier specifically points to it.
+
+### 9.5 Quote/punctuation normalization (mandatory)
+
+Catalog uses ONLY ASCII quotes:
+- `"` (574 occurrences) — `תנ"ך`, `יח"ל`, `חט"ב`, `מט"ח`
+- `'` (2,247 occurrences) — `כיתה ג'`, `ג'ינס`, `בז'`
+
+Catalog has **zero** occurrences of U+05F3 `׳` or U+05F4 `״`. **Before any title search**, normalize customer input:
+- Replace `׳` → `'`
+- Replace `״` → `"`
+- Keep multi-letter color tokens like `ג'ינס` intact (treat as one token, do NOT split on the apostrophe).
+
+### 9.6 Color = primary discriminator (equal weight to grade and module letter)
+
+Catalog series version by color in 20+ values. Customer color tokens are mandatory disambiguators when present.
+
+**Color list seen (most common):** ירוק (207), כחול (140), סגול (122), כתום (103), צהוב (95), אדום (88), לבן (64), חום (52), בורדו (52), תכלת (51), ורוד (42), שחור (32), אפור (28), זהב (18), טורקיז (14), בז' (6), ג'ינס (1), כסף (1).
+
+**Stripe combos:** `<base color> פס <accent>` (e.g., `ירוק פס אפור`, `סגול פס לבן`). Customers say only the base color → strip the accent for matching but keep for display.
+
+**`כחול` ≠ `כחול/תכלת`** — these are two distinct SKUs. If both fit, ALWAYS ask.
+
+### 9.7 תנ"ך קורן full enumeration (most-asked title)
+
+| mfrSku / Sku | Title | Notes |
+|---|---|---|
+| 90068 | תנ"ך קורן לשוניות - כחול | live |
+| 900937 | תנ"ך קורן לשוניות ורוד | live |
+| 900938 | תנ"ך קורן לשוניות טורקיז | live |
+| 900939 | תנ"ך קורן לשוניות ירוק | live |
+| 900940 | תנ"ך קורן לשוניות כחול/תכלת | live, ≠ #90068 |
+| 900941 | תנ"ך קורן לשוניות סגול | live |
+| 9009348 | תנ"ך קורן לשוניות בז' | live (replaces כתום) |
+| **900340** | **תנ"ך קורן לשוניות ג'ינס** | live |
+| 9789653019102 | תנ"ך קורן לשוניות כתום | **אזל** → offer בז' |
+| 9789657767993 | תנ"ך קורן מהדורת מוריה (כיס) | pocket |
+| 26562 | תנ"ך קורן ירושלים גדול | large hardcover |
+| 9789653019660 | חומש קורן אריאל בראשית | חומש (single book) |
+
+Customer often omits "לשוניות" — assume it when only color is given.
+Customer says "כתום" → respond with בז' substitute and explicitly say so.
+All eight live colors are ₪129 (uniform pricing — useful sanity check).
+
+### 9.8 Teacher vs student edition (silent precision killer)
+
+- **169 rows** contain `תדריך למורה` / `תדריך מורה`.
+- **24 rows** contain `מדריך למורה`.
+- **5 rows** contain `ערכה למורים` / `למורה` / `לגננת`.
+
+Same series often has both editions at very different prices — e.g., `ריד 1 READ`: `153-404` (תלמיד, ₪48.40) vs `153-411` (תדריך למורה, ₪33.89).
+
+**Default rule:** if customer DOES NOT explicitly say "מורה" / "תדריך" / "מדריך" / "פתרונות" / "מפתח תשובות" → exclude all candidates whose title contains those tokens. Pick student edition.
+
+### 9.9 Bilingual (~14.6%) — search both languages
+
+938 titles contain BOTH Hebrew transliteration AND Latin original. Pattern: `<Hebrew transliteration> <Latin original> [/<author>] [(color)]`.
+
+| Latin | Hebrew transliteration |
+|---|---|
+| READ | ריד |
+| EXAM PRACTICE | אקסם פרקטיס |
+| MODULE | מודול |
+| SPRINT TO BAGRUT | ספרינט טו בגרות |
+| NEW | ניו |
+| TIME FOR | טיים פור |
+| JOIN US | גוין אס |
+| ON TRACK | און טרק |
+| ENGLISH | אינגליש |
+| ADVENTURE | אדוונצ'ר |
+| ENTRY POINT | אנטרי פוינט |
+| GET READY | גט רדי |
+| MASTERING | מאסטרינג |
+| HIGH FIVE | הי פייב |
+| VISION | ויז'ן |
+| WORDS AND MORE | וורדס אנד מור |
+| ACCESS | אקסס |
+| BAGRUT | בגרות |
+
+When customer writes a Latin form, run two parallel `search_book_by_title` calls (Latin + Hebrew transliteration) and merge.
+
+### 9.10 Hebrew prefix stripping
+
+Catalog rows often start with Hebrew prefixes: `במבט חדש` (not `מבט חדש`), `לכיתה ט'`. Before token-matching:
+- Strip leading ב/ה/ו/ל/מ/כ from any token whose remainder is ≥3 chars.
+- Apply both to customer-side tokens AND when scoring against catalog titles.
+
+### 9.11 Series scope (out-of-range = unmatched, NOT fuzzy match)
+
+| Series | Grade range | Publisher | Note |
+|---|---|---|---|
+| שבילים (math) | א'-ו' (1-6) only | מט"ח | "שבילים 9" / "שבילים ט'" = unmatched |
+| חוקרים חשבון /אורן פיש | א'-ה' (1-5) | יסוד | |
+| ארכימדס | א'-ו' | various | |
+| מבט חדש | varies by subject | יואל גבע / מטח | "מבט חדש מתמטיקה" — verify subject exists |
+| תנ"ך קורן | (no grade) | קורן | only color/edition matters |
+
+If a customer's grade is outside the known range → reply "unmatched" with a focused note ("סדרת X מקיפה רק כיתות Y-Z; האם התכוונת לסדרה אחרת?").
+
+### 9.12 Publisher prefix → group map (high-confidence shortcuts)
+
+| Prefix | Publisher | Confidence |
+|---|---|---|
+| `78-` | מט"ח | pure (553/557) |
+| `51-` | יסוד | pure |
+| `41-` | זק | pure |
+| `1004-` | AEL | pure |
+| `1131-` | קרן תל"י | pure |
+| `103-` | לילך | pure |
+| `279-` | מכון וויצמן | pure |
+| `153-` | אריק כהן | very strong (587/605) |
+| `186-` | משרד החינוך | strong (417/419) |
+| `119-` | בונוס | strong (355/357) |
+| `42-` | כנרת לימוד | strong |
+
+Use the prefix as a publisher hint when title is ambiguous. For mixed prefixes (`350-`, `199-`, `416-`, `800-`, `434-`, `728-`) — do NOT infer publisher from prefix alone.
+
+### 9.13 Search escalation ladder (the new Stage D)
+
+For each customer line item, run in order; **stop at the first step that yields a unique confident match**.
+
+**Step 0 — Normalize input**
+- Collapse `׳→'`, `״→"`.
+- Strip Hebrew prefixes ב/ה/ו/ל/מ/כ from leading word.
+- Tokenize: identifier candidates, series name, subject, grade letter, color, module letter, edition markers (תדריך/מדריך/פתרונות/חוברת), publisher.
+
+**Step 1 — Identifier lookup** (deterministic)
+- Detected ID? → `lookup_book_by_id(<value>)`.
+- 1 hit → DONE, confidence = 1.00.
+- 0 hits → flag `fallbacks: ["mfrSku-not-found"]` and continue to Step 2.
+- ≥2 hits → Step 4 (rare; ISBN-13 collisions).
+
+**Step 2 — Title primary keyword**
+- `search_book_by_title(keyword=<head noun>)`. The head is the series/title noun, NOT a color/grade/edition marker.
+- Examples: `"תנ"ך קורן ג'ינס"` → keyword=`קורן`. `"שבילים ב' פלוס"` → keyword=`שבילים`. `"READ 1"` → keyword=`READ` (and parallel `ריד`).
+- 0 hits + Latin term used → retry with Hebrew transliteration counterpart (table 9.9).
+- 0 hits all retries → unmatched.
+- 1 hit → score it (Step 5).
+- ≥2 hits → Step 3.
+
+**Step 3 — Apply discriminators**
+Re-rank candidates by token overlap with the full customer line, with **1.5× weight** for: color, grade, module letter.
+
+Auto-exclude rules (apply BEFORE scoring):
+- Drop candidates whose title starts with `**` or `* `.
+- Drop candidates containing `אזל`, `לא לקבל`, `לא למכירה`, `ישן`.
+- Drop candidates containing `תדריך`/`מדריך למורה`/`למורה`/`פתרונות`/`מפתח תשובות` UNLESS customer line explicitly mentions one of those tokens.
+
+**Step 4 — Cross-validate by publisher**
+If ≥2 candidates remain and customer named a publisher → filter by `group`. If exactly 1 remains → DONE.
+
+**Step 5 — Score & decide**
+```
+score = (matched_tokens / customer_tokens) * 0.7
+      + (matched_tokens / candidate_tokens) * 0.3
+weighted 1.5× on color, grade, module letter tokens
+```
+
+| Score band | Action | Required |
+|---|---|---|
+| ≥ 0.90 | auto-match (`status: "matched"`) | gap-to-second ≥ 0.15 AND no exclusion flag hit |
+| 0.70 – 0.90 | match-with-uncertainty (`status: "match_with_uncertainty"`) | gap ≥ 0.15; populate `clarificationQuestion` |
+| < 0.70 | unmatched (`status: "unmatched"`) + ask | |
+| Tied (gap < 0.15) at any absolute score | unmatched, regardless | binding |
+
+### 9.14 Ambiguity rule (binding)
+
+If top 2 candidates within **0.15** of each other → DO NOT auto-match. Generate a clarification question naming the specific distinguisher (color / grade / edition / teacher-vs-student). Example:
+
+> תנ"ך קורן לשוניות — כחול רגיל (90068) או כחול/תכלת (900940)?
+
+### 9.15 Negative test cases (memorize)
+
+| Input | Naive failure | Correct |
+|---|---|---|
+| `350-3005` | search_records → 8 fuzzy hits, wrong top | lookup_book_by_id with `=` filter → 1 exact (Sku 10445) |
+| `תנ"ך קורן ג'ינס` | fuzzy → 90068 (כחול) at 0.55 — WRONG | keyword=קורן → 16 → filter by color "ג'ינס" → exactly 900340 |
+| `READ 1` | first hit may be teacher edition 153-411 | exclude "תדריך למורה" → only 153-404 |
+| `תנ"ך קורן כחול` | matches 90068 OR 900940 — both with "כחול" | gap < 0.15 → ASK |
+| `שבילים ט'` | fuzzy across 76 שבילים rows | series scope = א'-ו' → unmatched + ask |
+| `תנ"ך קורן כתום` | discontinued (אזל) | offer בז' (9009348) substitute |
+
+### 9.16 Output schema additions for Agent Mode
+
+Each item in the output `items[]` must include these fields beyond the base Section 8 schema:
+
+```json
+{
+  "rawLine": "string from email",
+  "matchedSku": null,
+  "matchedMfrSku": null,
+  "matchedTitle": null,
+  "matchedRecordId": null,
+  "matchMethod": "sku | mfrSku | dana | isbn | title-fuzzy | unmatched",
+  "matchConfidence": 0.0,
+  "status": "matched | match_with_uncertainty | needs_clarification | unmatched",
+  "candidates": [
+    { "sku": null, "mfrSku": null, "title": null, "score": 0.0, "distinguisher": "color/grade/edition/teacher" }
+  ],
+  "clarificationQuestion": null,
+  "quantity": null,
+  "unitPrice": null,
+  "uncertaintyReason": null
+}
+```
+
+`status` and `clarificationQuestion` are MANDATORY on every item. Use the score thresholds from §9.13 to set them.
+
+### 9.17 Hard constraints (non-negotiable)
+
+1. **Never invent** an SKU, mfrSku, title, or price. Only emit values returned by tool calls.
+2. **Never auto-match** when gap-to-second < 0.15.
+3. **Never auto-match** a `**` / `אזל` candidate.
+4. **Never auto-match** a teacher edition unless customer asked for one.
+5. **Never** route an identifier through `search_book_by_title`.
+6. **Never** skip Step 0 normalization.
+7. **Always** populate `candidates[]` (top 3) when status ≠ `matched`.
+8. **Always** populate `clarificationQuestion` (Hebrew, single-sentence, names the distinguisher) when status ∈ `{match_with_uncertainty, needs_clarification, unmatched}`.
+
+### 9.18 maxIterations budget
+
+Worst case: 1 ID lookup + 3 title probes + 1 publisher filter + 1 transliteration retry + slack = **8 iterations**. Hard cap at **12** — if exceeded, force `unmatched` with `fallbacks: ["max-iterations-exceeded"]`.
